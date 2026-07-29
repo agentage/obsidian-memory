@@ -1,0 +1,208 @@
+name: Release Train
+
+# Fully automated Friday MINOR release of the Obsidian community-store plugin.
+# No human step on the happy path. Weekly cadence, always a minor bump (L0).
+#
+# Flow: wait for org dependabot triage -> skip if no releasable commits since the
+# last tag (docs/ci/plain-chore excluded, chore(deps) counts) -> minor bump via the
+# repo's own `npm version` (the `version` script runs scripts/version-bump.mjs,
+# updating package.json + manifest.json + versions.json) -> `npm run verify` ->
+# open `chore(release): X.Y.Z` PR -> auto-merge -> dispatch release.yml in
+# build-current mode, which tags the bare version X.Y.Z (Obsidian requires
+# tag == manifest.json version) and builds + publishes the GitHub Release with the
+# plugin assets (main.js, manifest.json, styles.css).
+#
+# GITHUB_TOKEN caveats handled here: its branch push does not fire pr-validation on
+# the release PR (the in-workflow `npm run verify` plus release.yml's verify are the
+# CI gates; master-protection requires a PR but 0 approvals and no status checks, so
+# --auto lands in a clean status and the direct-squash fallback merges), and its
+# merge never fires other workflows - so the publish chain is dispatched explicitly.
+on:
+  schedule:
+    # Friday 20:00 Europe/Prague, both DST offsets; the gate job filters.
+    - cron: '0 18 * * 5'
+    - cron: '0 19 * * 5'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+  actions: write
+
+jobs:
+  prague-gate:
+    name: 🕗 Friday 20:00 Prague gate
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      go: ${{ steps.gate.outputs.go }}
+    steps:
+      - name: Check local Prague hour (DST-proof)
+        id: gate
+        run: |
+          # Both UTC crons target Friday 20:00 Europe/Prague; only the slot where
+          # the local hour is actually 20 proceeds, the other exits 0 silently.
+          if [ "${{ github.event_name }}" != "schedule" ]; then
+            echo "workflow_dispatch - bypassing hour gate."
+            echo "go=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          HOUR=$(TZ=Europe/Prague date +%H)
+          if [ "$HOUR" = "20" ]; then
+            echo "Prague hour is 20 - proceeding."
+            echo "go=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "Prague hour is $HOUR, not 20 - wrong DST cron slot, skipping."
+            echo "go=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  dependabot-quiescence:
+    name: 🤖 Wait for dependabot triage to finish
+    needs: prague-gate
+    if: needs.prague-gate.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - name: Wait until this repo has no fresh open dependabot PRs
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # Dependabot merging is owned by the org triage automation; this job only
+          # delays the train while that agent may still be working, so this week's
+          # bumps ride this week's release. PRs still open after the wait were left
+          # deliberately by triage - the train departs without them.
+          for i in $(seq 1 45); do
+            OPEN=$(gh pr list -R "$REPO" --author "app/dependabot" --state open --json number --jq 'length')
+            [ "$OPEN" = "0" ] && { echo "No open dependabot PRs - proceeding."; exit 0; }
+            echo "poll $i: $OPEN open dependabot PR(s), waiting for triage..."
+            sleep 60
+          done
+          echo "Dependabot PR(s) still open after wait - releasing without them." | tee -a "$GITHUB_STEP_SUMMARY"
+
+  release:
+    name: 🚝 Cut minor release
+    needs: [prague-gate, dependabot-quiescence]
+    if: needs.prague-gate.outputs.go == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Skip if an open release PR exists
+        id: guard
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          EXISTING=$(gh pr list --state open --json headRefName \
+            --jq '[.[] | select(.headRefName | startswith("release/"))] | length')
+          if [ "$EXISTING" != "0" ]; then
+            echo "Open release PR already exists - a previous train is stuck. Skipping." | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Detect releasable commits since the last tag
+        id: detect
+        if: steps.guard.outputs.skip != 'true'
+        run: |
+          set -euo pipefail
+          # Highest semver tag, NOT `git describe`: historical tags were made on
+          # side branches and are not ancestors of master, so describe returns stale.
+          LAST_TAG=$(git tag --list '[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -1)
+          if [ -z "$LAST_TAG" ]; then
+            RANGE=""
+            echo "No tag found, considering full history."
+          else
+            RANGE="${LAST_TAG}..HEAD"
+            echo "Last tag: $LAST_TAG"
+          fi
+          SUBJECTS=$(git log $RANGE --no-merges --pretty=%s)
+          # Releasable = any commit whose type is NOT docs/chore/ci, PLUS dependency
+          # bumps (chore(deps*): dependabot bundles ship weekly). chore(release) stays
+          # excluded; legacy bare-version subjects (`0.2.0 (#28)`) do not count.
+          if [ -n "$SUBJECTS" ]; then
+            NON_CHORE=$(printf '%s\n' "$SUBJECTS" \
+              | grep -vE '^(docs|chore|ci)(\([^)]*\))?!?:' \
+              | grep -vcE '^[0-9]+\.[0-9]+\.[0-9]+' || true)
+            DEPS=$(printf '%s\n' "$SUBJECTS" | grep -cE '^chore\(deps' || true)
+            RELEASABLE=$((NON_CHORE + DEPS))
+          else
+            RELEASABLE=0
+          fi
+          if [ "$RELEASABLE" -eq 0 ]; then
+            echo "No releasable commits since ${LAST_TAG:-repo start} - no release this week." | tee -a "$GITHUB_STEP_SUMMARY"
+            echo "release=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "Found $RELEASABLE releasable commit(s)."
+            echo "release=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Bump minor version (no tag)
+        id: bump
+        if: steps.guard.outputs.skip != 'true' && steps.detect.outputs.release == 'true'
+        run: |
+          set -euo pipefail
+          # --no-git-tag-version: skip commit + tag; the `version` script still runs
+          # scripts/version-bump.mjs (updates manifest.json + versions.json).
+          npm version --no-git-tag-version minor
+          npm install --package-lock-only
+          NEW_VERSION=$(node -p "require('./package.json').version")
+          echo "New version: $NEW_VERSION"
+          echo "version=$NEW_VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Verify (type-check + lint + format + test + build + store checks)
+        if: steps.bump.outputs.version
+        run: npm run verify
+
+      - name: Create + auto-merge release PR
+        id: pr
+        if: steps.bump.outputs.version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.bump.outputs.version }}"
+          BRANCH="release/${VERSION}"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git checkout -b "$BRANCH"
+          git add package.json package-lock.json manifest.json versions.json
+          git commit -m "chore(release): ${VERSION}"
+          git push origin "$BRANCH"
+          PR_URL=$(gh pr create --base master --head "$BRANCH" \
+            --title "chore(release): ${VERSION}" \
+            --body "Weekly minor release train. Bumps package.json + manifest.json + versions.json to ${VERSION}. After merge, release.yml is dispatched in build-current mode to tag \`${VERSION}\` and publish the GitHub Release the Obsidian store installs from.")
+          echo "pr_url=$PR_URL" >> "$GITHUB_OUTPUT"
+          sleep 5
+          # --auto waits for required checks; master-protection has none, so GitHub
+          # rejects --auto with "clean status" and the direct squash lands it.
+          if ! OUT=$(gh pr merge "$PR_URL" --auto --squash 2>&1); then
+            echo "$OUT"
+            echo "$OUT" | grep -q "clean status" && gh pr merge "$PR_URL" --squash || exit 1
+          fi
+
+      - name: Dispatch release workflow (build-current)
+        if: steps.pr.outputs.pr_url
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # A GITHUB_TOKEN merge never fires release.yml, so dispatch it explicitly.
+          # build_current=true makes release.yml tag + build + release the version
+          # already on master's manifest.json (no re-bump).
+          gh workflow run release.yml --ref master --repo "${{ github.repository }}" -f build_current=true
+          echo "Released ${{ steps.bump.outputs.version }} - release.yml dispatched (build-current)." >> "$GITHUB_STEP_SUMMARY"
