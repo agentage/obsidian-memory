@@ -19,8 +19,9 @@ name: Release Train
 # merge never fires other workflows - so the publish chain is dispatched explicitly.
 on:
   schedule:
-    # Friday 20:00 Europe/Prague, both DST offsets; the gate job filters.
-    - cron: '0 18 * * 5'
+    # Single UTC cron (L0 slot). A late-firing cron means the train departs
+    # late instead of being gated away - no Prague/DST hour check anymore.
+    # Dependabot opens PRs 16:00 UTC Friday; org triage merges from 17:00 UTC.
     - cron: '0 19 * * 5'
   workflow_dispatch:
 
@@ -30,36 +31,8 @@ permissions:
   actions: write
 
 jobs:
-  prague-gate:
-    name: 🕗 Friday 20:00 Prague gate
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    outputs:
-      go: ${{ steps.gate.outputs.go }}
-    steps:
-      - name: Check local Prague hour (DST-proof)
-        id: gate
-        run: |
-          # Both UTC crons target Friday 20:00 Europe/Prague; only the slot where
-          # the local hour is actually 20 proceeds, the other exits 0 silently.
-          if [ "${{ github.event_name }}" != "schedule" ]; then
-            echo "workflow_dispatch - bypassing hour gate."
-            echo "go=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          HOUR=$(TZ=Europe/Prague date +%H)
-          if [ "$HOUR" = "20" ]; then
-            echo "Prague hour is 20 - proceeding."
-            echo "go=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "Prague hour is $HOUR, not 20 - wrong DST cron slot, skipping."
-            echo "go=false" >> "$GITHUB_OUTPUT"
-          fi
-
   dependabot-quiescence:
     name: 🤖 Wait for dependabot triage to finish
-    needs: prague-gate
-    if: needs.prague-gate.outputs.go == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 50
     steps:
@@ -83,8 +56,7 @@ jobs:
 
   release:
     name: 🚝 Cut minor release
-    needs: [prague-gate, dependabot-quiescence]
-    if: needs.prague-gate.outputs.go == 'true'
+    needs: dependabot-quiescence
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
