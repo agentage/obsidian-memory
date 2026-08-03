@@ -59,7 +59,7 @@ export async function startLoopbackServer(): Promise<LoopbackHandle> {
     throw new Error('could not bind a loopback port for sign-in');
   }
 
-  // `window` in the Obsidian renderer; the global fallback is only ever taken under node
+  // `window` in the Obsidian renderer; the bare-global fallback is only ever taken under node
   // (vitest), where `window` is absent - a transient OAuth timer needs no popout scoping.
   type TimerHost = {
     setTimeout: (cb: () => void, ms: number) => number;
@@ -68,8 +68,7 @@ export async function startLoopbackServer(): Promise<LoopbackHandle> {
   const timers: TimerHost =
     typeof window !== 'undefined'
       ? (window as unknown as TimerHost)
-      : // eslint-disable-next-line obsidianmd/no-global-this -- node test fallback; renderer uses window
-        (globalThis as unknown as TimerHost);
+      : ({ setTimeout, clearTimeout } as unknown as TimerHost);
   const timer = timers.setTimeout(() => {
     server.close();
     rejectParams(new Error('sign-in timed out'));
