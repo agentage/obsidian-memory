@@ -6,7 +6,6 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { FakeVault } from './fake-vault';
 import { fakeSecrets, type FakeSecrets } from './fake-secrets';
-import { FakeCouch } from './fake-couch';
 import { FakeAuthServer, type FakeMemory } from './fake-auth-server';
 import { Router } from './router';
 import { requestUrlMock, makeFakeApp } from './obsidian';
@@ -20,24 +19,16 @@ export interface BootOptions {
   fqdn?: string;
   files?: Record<string, string>;
   memories?: FakeMemory[];
-  memoryName?: string; // the couch-channel memory the resolution advertises
-  couchDb?: string;
-  // Additional couch-channel memories, each with its own db name + fresh in-memory store, so a
-  // memory-switch test can prove the controller repoints to a new db without reusing the old one.
-  extraCouch?: Array<{ memory: string; db: string }>;
   desktop?: boolean; // Platform.isDesktopApp; false -> obsidian:// deep-link sign-in path
 }
 
 export interface Handles {
   plugin: import('../../src/main').default;
-  couch: FakeCouch;
   auth: FakeAuthServer;
   vault: FakeVault;
   router: Router;
   secrets: FakeSecrets;
   configDir: string;
-  /** Extra couch stores keyed by memory name (only when BootOptions.extraCouch was given). */
-  extraCouch: Record<string, FakeCouch>;
   /** URLs passed to window.open (the authorize redirect). */
   openedUrls: string[];
   teardown: () => Promise<void>;
@@ -53,20 +44,11 @@ type WindowStub = {
 
 export async function bootPlugin(opts: BootOptions = {}): Promise<Handles> {
   const fqdn = opts.fqdn ?? 'test.local';
-  const memoryName = opts.memoryName ?? 'work';
-  const couchDb = opts.couchDb ?? 'mem_work';
 
   const vault = new FakeVault(opts.files ?? {});
   const secrets = fakeSecrets();
-  const couch = new FakeCouch(couchDb);
-  const auth = new FakeAuthServer({ memories: opts.memories ?? [], couchDb });
-  const extra = (opts.extraCouch ?? []).map((e) => ({
-    memory: e.memory,
-    couch: new FakeCouch(e.db),
-  }));
-  const extraCouch: Record<string, FakeCouch> = {};
-  for (const e of extra) extraCouch[e.memory] = e.couch;
-  const router = new Router({ fqdn, auth, couch, memoryName, extraCouch: extra });
+  const auth = new FakeAuthServer({ memories: opts.memories ?? [] });
+  const router = new Router({ fqdn, auth });
 
   requestUrlMock.mockImplementation(router.requestUrl);
 
@@ -118,13 +100,11 @@ export async function bootPlugin(opts: BootOptions = {}): Promise<Handles> {
 
   return {
     plugin,
-    couch,
     auth,
     vault,
     router,
     secrets,
     configDir,
-    extraCouch,
     openedUrls,
     teardown,
   };

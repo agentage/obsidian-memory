@@ -1,14 +1,13 @@
 import { type App, Modal, Setting } from 'obsidian';
 
 export interface SyncPreview {
-  incoming?: number; // git channel: files to receive from the cloud; couch omits it (only known after a pull)
-  outgoing: number; // local changes to send up (couch: content differs from the push cache - honest count)
+  incoming?: number; // files to receive from the cloud
+  outgoing: number; // local changes to send up
   firstSync: boolean; // no memory chosen / not signed in yet - nothing to preview
 }
 
-// The post-sign-in sync popup: shows what the next sync will move, then runs the sync and
-// reports the result. Git memories show both directions; couch memories show only the honest
-// outgoing count. Informational + non-blocking (the sync auto-starts).
+// The post-sign-in sync popup: shows what the next sync will move (both directions), then runs
+// the sync and reports the result. Informational + non-blocking (the sync auto-starts).
 class SyncPreviewModal extends Modal {
   constructor(
     app: App,
