@@ -1,6 +1,6 @@
 // In-memory Better Auth AS + management API: OAuth 2.1 discovery / DCR / token / refresh /
-// revoke, the couch-token minter, and GET/POST /api/memories. Contracts mirror the real
-// wire the plugin's src/auth/* + src/couch/couch-token + main.ts:listVaults speak.
+// revoke, and GET/POST /api/memories. Contracts mirror the real wire the plugin's src/auth/*
+// + main.ts:listVaults speak.
 
 export interface FakeMemory {
   name: string;
@@ -28,13 +28,11 @@ export class FakeAuthServer {
   private clientSeq = 0;
   private tokenSeq = 0;
   readonly memories: FakeMemory[];
-  readonly couchDb: string;
   private failNextStatus?: number;
   private failNextMgmtStatus?: number;
 
-  constructor(opts: { memories?: FakeMemory[]; couchDb?: string } = {}) {
+  constructor(opts: { memories?: FakeMemory[] } = {}) {
     this.memories = opts.memories ?? [];
-    this.couchDb = opts.couchDb ?? 'mem_default';
   }
 
   failNext(status: number): void {
@@ -53,7 +51,7 @@ export class FakeAuthServer {
     return { status, json: { error: { message: 'management endpoint unavailable' } } };
   }
 
-  /** Is `access` a live (unrevoked) access token? Used by the api + couch-token guards. */
+  /** Is `access` a live (unrevoked) access token? Used by the api guards. */
   isValidAccess(access: string): boolean {
     return this.tokens.has(access);
   }
@@ -97,7 +95,6 @@ export class FakeAuthServer {
     if (pathname.endsWith('/register')) return this.register();
     if (pathname.endsWith('/token')) return this.token(body);
     if (pathname.endsWith('/revoke')) return { status: 200, json: {} };
-    if (pathname.endsWith('/account/couch-token')) return this.couchToken(body);
     return { status: 404, json: { error: 'not_found' } };
   }
 
@@ -141,17 +138,6 @@ export class FakeAuthServer {
       return this.issue(prior?.clientId ?? p.get('client_id') ?? 'client');
     }
     return { status: 400, json: { error: 'unsupported_grant_type' } };
-  }
-
-  private couchToken(body?: string): AuthReply {
-    const memory = (JSON.parse(body ?? '{}') as { memory?: string }).memory ?? 'default';
-    return {
-      status: 200,
-      json: {
-        success: true,
-        data: { jwt: `couch-jwt-${memory}`, db: this.couchDb, sub: `u/${memory}`, expSec: 3600 },
-      },
-    };
   }
 
   /** GET /api/memories -> { data:[{name,entries,folderCount,updated}] }. */

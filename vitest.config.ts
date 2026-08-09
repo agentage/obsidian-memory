@@ -4,18 +4,15 @@ export default defineConfig({
   test: {
     // src unit tests + the assembled-plugin integration harness (test/**) run in one pass.
     include: ['src/**/*.test.ts', 'test/**/*.test.ts'],
-    testTimeout: 30000, // git smart-HTTP spawns git-http-backend; couch tests exercise retry/backoff
+    testTimeout: 30000, // git smart-HTTP spawns git-http-backend
     coverage: {
       provider: 'v8',
       include: ['src/**/*.ts'],
       // Excluded: Obsidian-runtime files (App/TFile/PluginSettingTab/setIcon/Vault +
       // window/crypto.subtle), the node-only test git server helper, and type/test files.
-      // The pure engine (merge-note, stream-utils, resolve-host, vaults-config), the couch
-      // discovery + token flow (resolve-host, couch-token), the couch doc model + persisted
-      // sync state (couch-doc, couch-state), the DI git-client (against a real local git
-      // server), and the requestUrl HttpClient adapter (against a mocked requestUrl) ARE
-      // unit/integration tested. couch-sync is the Vault/requestUrl-coupled replication driver
-      // (same bucket as vault-fs; exercised by couch-sync.test.ts); doc model matches the bridge.
+      // The pure engine (merge-note, stream-utils, resolve-host, vaults-config), the DI
+      // git-client (against a real local git server), and the requestUrl HttpClient adapter
+      // (against a mocked requestUrl) ARE unit/integration tested.
       exclude: [
         '**/*.test.ts',
         '**/*.types.ts',
@@ -25,7 +22,6 @@ export default defineConfig({
         'src/actions-menu.ts',
         'src/git/vault-fs.ts',
         'src/git/git-test-server.ts',
-        'src/couch/couch-sync.ts',
       ],
       thresholds: { branches: 70, functions: 70, lines: 70, statements: 70 },
     },

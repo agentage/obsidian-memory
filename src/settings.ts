@@ -35,22 +35,6 @@ export interface AgentageMemorySettings {
   /** Dev/testing host override, set directly in data.json (no on-page editor). Empty = env-or-prod.
    * Read once at load by resolveSiteFqdn; applies on the next Obsidian restart. */
   siteFqdn: string;
-  /** Per-(host, memory) couch sync state (pull cursor + push-rev cache + pending pushes),
-   * keyed "<host>:<memory>". Plugin-local; never written to vaults.json. */
-  couchState: Record<string, CouchMemoryState>;
-}
-
-/** Persisted couch sync state for one (host, memory). All fields optional so an older
- * data.json (or a fresh memory) hydrates to sensible defaults. */
-export interface CouchMemoryState {
-  /** Last fully-applied _changes seq; resumes the pull after a reload. */
-  cursor?: string;
-  /** path -> last pushed content rev (ordered leaf ids); skips an unchanged push. */
-  revs?: Record<string, string>;
-  /** Paths whose live push failed, retried on the next tick. */
-  pending?: string[];
-  /** Paths whose live DELETE failed, retried on the next tick. */
-  pendingDeletes?: string[];
 }
 
 export const MCP_ENDPOINT = 'https://memory.agentage.io/mcp';
@@ -87,7 +71,6 @@ export const DEFAULT_SETTINGS: AgentageMemorySettings = {
   configDir: '~/.agentage',
   writtenVaultName: '',
   siteFqdn: '',
-  couchState: {},
 };
 
 export const PROD_SITE_FQDN = 'agentage.io';

@@ -1,8 +1,8 @@
 import { TFile } from 'obsidian';
 
-// Lifted from src/couch/couch-sync.test.ts and extended with a real event emitter so the
-// assembled plugin's live handlers (vault.on 'create'/'modify'/'delete'/'rename') can be
-// driven, and with getName/adapter so main.ts's vault-name + root-path helpers work.
+// A minimal in-memory Vault fake with a real event emitter so an assembled-plugin test can
+// drive vault.on('create'/'modify'/'delete'/'rename'), plus getName/adapter so main.ts's
+// vault-name + root-path helpers work.
 
 export type VaultEvent = 'create' | 'modify' | 'delete' | 'rename';
 type Listener = (file: TFile, oldPath?: string) => void;

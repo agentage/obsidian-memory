@@ -1,4 +1,4 @@
-import { FileSystemAdapter, Menu, Notice, Platform, Plugin, TFile, requestUrl } from 'obsidian';
+import { FileSystemAdapter, Menu, Notice, Platform, Plugin, requestUrl } from 'obsidian';
 import type { FsClient, MergeDriverCallback } from 'isomorphic-git';
 import {
   type AgentageMemorySettings,
@@ -29,20 +29,10 @@ import { createAuthJsonWriter, readAuthJsonState } from './auth/auth-json';
 import { startLoopbackServer } from './auth/loopback-server';
 import type { HttpPost } from './auth/oauth';
 import type { GetJson } from './auth/discovery';
-import {
-  HostResolver,
-  buildRepoUrl,
-  channelForVault,
-  gitMemoryFromConfig,
-  type SyncResolution,
-} from './resolve-host';
+import { HostResolver, buildRepoUrl, type SyncResolution } from './resolve-host';
 import { openMemoryChooser } from './memory-chooser';
 import { openActionsMenu, type PluginAction } from './actions-menu';
 import { openSyncPreview, type SyncPreview } from './sync-preview-modal';
-import { CouchSync, type CouchAuthorize } from './couch/couch-sync';
-import { CouchChannel } from './couch/couch-channel';
-import { CouchState } from './couch/couch-state';
-import { CouchTokenClient, type CouchTokenPost } from './couch/couch-token';
 
 // Single-host: every origin derives from the site FQDN. Precedence: the persisted
 // `siteFqdn` setting (non-empty) > the AGENTAGE_SITE_FQDN env var (desktop only, same
@@ -101,11 +91,6 @@ export default class AgentageMemoryPlugin extends Plugin implements SettingsHost
   // if the OS keyring (secretStorage) is unavailable; persisted via secretStorage +
   // ~/.agentage/auth.json. Hydrated from auth.json on desktop at load.
   private readonly secretCache = new Map<string, string>();
-  // Couch channel (discovery-driven): holds the one live controller per couch-channel memory,
-  // rebuilt on a memory switch and torn down on a git-route sync / sign-out (see CouchChannel).
-  private readonly couchChannel = new CouchChannel();
-  private couchWired = false;
-  private couchTokenPost!: CouchTokenPost;
 
   async onload(): Promise<void> {
     await this.loadSettings();
@@ -150,117 +135,6 @@ export default class AgentageMemoryPlugin extends Plugin implements SettingsHost
     this.addCommand({ id: 'open-menu', name: 'Open menu', callback: () => this.openActions() });
     // Already signed in with a memory at startup -> sync silently (no popup every launch).
     this.autoSyncOnReady(false);
-  }
-
-  // Live replication for the couch channel: push on md edits, pull on an interval. Registered
-  // ONCE (Obsidian ties registerEvent/registerInterval to unload); handlers delegate to the
-  // current per-memory controller, so a memory switch repoints without re-registering.
-  private wireCouchEvents(): void {
-    if (this.couchWired) return;
-    this.couchWired = true;
-    const onMd = (cb: (path: string) => void) => (f: unknown) => {
-      if (f instanceof TFile && f.extension === 'md') cb(f.path);
-    };
-    this.registerEvent(
-      this.app.vault.on(
-        'modify',
-        onMd((p) => void this.couchChannel.pushFileLive(p))
-      )
-    );
-    this.registerEvent(
-      this.app.vault.on(
-        'create',
-        onMd((p) => void this.couchChannel.pushFileLive(p))
-      )
-    );
-    this.registerEvent(
-      this.app.vault.on(
-        'delete',
-        onMd((p) => void this.couchChannel.removeFile(p))
-      )
-    );
-    this.registerEvent(
-      this.app.vault.on('rename', (f, oldPath) => {
-        if (f instanceof TFile && f.extension === 'md') {
-          void this.couchChannel.removeFile(oldPath);
-          void this.couchChannel.pushFileLive(f.path);
-        }
-      })
-    );
-    // Tick = flush any queued (failed) pushes/deletes, then pull. A torn-down channel no-ops.
-    this.registerInterval(window.setInterval(() => void this.couchChannel.tick(), 2000));
-  }
-
-  /** Sync a couch-channel memory: discovery already resolved endpoint/db/tokenUrl; mint the
-   * per-memory JWT on demand (cached, re-minted on expiry/401) and replicate the thin-client
-   * doc model against it. One live controller per memory; the server bridge commits couch -> git. */
-  private async couchSyncNow(
-    ch: { endpoint: string; db: string; tokenUrl: string },
-    memory: string
-  ): Promise<{ ok: boolean; message: string }> {
-    const couch = this.couchChannel.for(memory, () => this.buildCouchSync(ch, memory));
-    this.wireCouchEvents();
-    this.setStatusBar('syncing');
-    // CouchSync.syncNow is resilient (records, never throws): a failed side comes back as `error`.
-    const r = await couch.syncNow();
-    if (r.error) {
-      this.setStatusBar('error', r.error);
-      return { ok: false, message: r.error };
-    }
-    this.setStatusBar('idle');
-    return { ok: true, message: `${memory}: couch synced` };
-  }
-
-  /** The agentage git memory this vault folder's `.git` is bound to, or null when there is no
-   * `.git/config` or its origin remote is not on `gitEndpoint`. Reads via the raw adapter since
-   * `.git` is outside Obsidian's TFile index. Any read error degrades to null (do not block). */
-  private async gitBoundMemory(gitEndpoint: string): Promise<string | null> {
-    const adapter = this.app.vault.adapter;
-    try {
-      if (!(await adapter.exists('.git/config'))) return null;
-      return gitMemoryFromConfig(await adapter.read('.git/config'), gitEndpoint);
-    } catch {
-      return null;
-    }
-  }
-
-  /** Build a CouchSync for `memory`: mint the per-memory JWT on demand (cached, re-minted on
-   * expiry/401) + persist the pull cursor + push-rev cache + pending queues per (host, memory)
-   * through data.json, so a reload resumes instead of re-pulling from seq 0. */
-  private buildCouchSync(
-    ch: { endpoint: string; db: string; tokenUrl: string },
-    memory: string
-  ): CouchSync {
-    const tokenClient = new CouchTokenClient(
-      ch.tokenUrl,
-      memory,
-      this.couchTokenPost,
-      () => this.auth.getValidToken(),
-      () => Date.now()
-    );
-    const authorize: CouchAuthorize = () => tokenClient.token();
-    const state = this.couchStateFor(memory);
-    return new CouchSync(
-      this.app.vault,
-      { endpoint: ch.endpoint, db: ch.db },
-      authorize,
-      () => tokenClient.invalidate(),
-      state,
-      (m) => console.debug('[Agentage Couch]', m)
-    );
-  }
-
-  /** The persisted couch state for `memory`, keyed by (host, memory). Loaded the same way for
-   * the live controller and the offline preview count, so both read the same push-rev cache. */
-  private couchStateFor(memory: string): CouchState {
-    const key = `${this.activeFqdn}:${memory}`;
-    return new CouchState(
-      () => this.settings.couchState[key],
-      async (s) => {
-        this.settings.couchState[key] = s;
-        await this.saveSettings();
-      }
-    );
   }
 
   // --- site host (SettingsHost) ---
@@ -366,18 +240,6 @@ export default class AgentageMemoryPlugin extends Plugin implements SettingsHost
       },
       () => Date.now()
     );
-    // Mint the per-memory couch JWT: POST the plugin's OAuth bearer to the resolved
-    // couch_token_url; the auth service is the sole minter (CouchTokenClient caches it).
-    this.couchTokenPost = async (url, body, bearer) => {
-      const res = await requestUrl({
-        url,
-        method: 'POST',
-        headers: { Authorization: `Bearer ${bearer}`, 'Content-Type': 'application/json' },
-        body,
-        throw: false,
-      });
-      return { status: res.status, json: safeJson(res.text) };
-    };
   }
 
   private setStatusBar(s: SyncStatus, msg?: string): void {
@@ -406,8 +268,6 @@ export default class AgentageMemoryPlugin extends Plugin implements SettingsHost
   }
 
   private onAuthChanged(): void {
-    // Auto sign-out funnels here (not disconnect); drop the live couch controller so a new user reuses no stale db.
-    if (!this.auth.isSignedIn()) this.couchChannel.clear();
     this.settingTab?.display();
     this.refreshStatus();
   }
@@ -630,8 +490,6 @@ export default class AgentageMemoryPlugin extends Plugin implements SettingsHost
   }
   async disconnect(): Promise<void> {
     await this.auth.disconnect();
-    // Stop any live couch controller so it can't keep replicating into a signed-out vault.
-    this.couchChannel.clear();
     // Keep the selected memory across logout/login (persisted in data.json) so the next
     // sign-in resumes the same memory with no re-pick. A deleted/renamed memory is caught
     // at sync time (resolution + push), not by forgetting the choice here.
@@ -688,29 +546,8 @@ export default class AgentageMemoryPlugin extends Plugin implements SettingsHost
         };
       }
       syncedVault = chosen;
-      // Exactly one channel per memory: a resolution that advertises this memory on the couch
-      // channel routes to the couch controller; every other memory stays on the git path.
-      const ch = channelForVault(res, syncedVault);
-      if (ch.channel === 'couch') {
-        // A couch memory needs a git-free folder. If this folder is still a git working tree
-        // bound to a DIFFERENT git memory, couch-syncing into it silently mixes two memories in
-        // one folder - surface the cause instead of no-oping (never auto-delete the user's .git).
-        const gitMemory = await this.gitBoundMemory(res.gitEndpoint);
-        if (gitMemory && gitMemory !== syncedVault) {
-          const message =
-            `This folder is already synced as a git memory (${gitMemory}). A couch memory needs ` +
-            `its own (git-free) folder - open a new vault or remove the git binding.`;
-          new Notice(message);
-          return { ok: false, message };
-        }
-        this.lastVault = syncedVault;
-        return this.couchSyncNow(ch, syncedVault);
-      }
       remote = buildRepoUrl(res.gitEndpoint, syncedVault);
     }
-    // This memory is NOT couch: tear down any live couch controller so its live handlers + the
-    // 2s tick stop replicating the previous couch memory into (or out of) this git sync.
-    this.couchChannel.clear();
     this.lastVault = syncedVault; // so "Open dashboard" points at the vault we actually synced
     const ctrl = this.buildController();
     try {
@@ -732,10 +569,7 @@ export default class AgentageMemoryPlugin extends Plugin implements SettingsHost
     }
   }
 
-  // Non-mutating preview of the next sync for the popup, routed per channel like syncNow.
-  // Git memories preview both directions via the controller. Couch memories show the HONEST
-  // outgoing count - local md whose content-rev differs from (or is absent from) the push-rev
-  // cache (EVERY md file on a fresh memory); incoming is omitted (only known after a pull).
+  // Non-mutating preview of the next sync for the popup: both directions via the controller.
   private async previewSync(): Promise<SyncPreview> {
     const token = await this.auth.getValidToken();
     if (!token) return { outgoing: 0, firstSync: true };
@@ -745,10 +579,6 @@ export default class AgentageMemoryPlugin extends Plugin implements SettingsHost
     if (managed && !chosen) return { outgoing: 0, firstSync: true };
     if (managed) {
       const res = await this.resolver.resolve(token);
-      if (channelForVault(res, chosen).channel === 'couch') {
-        const outgoing = await CouchSync.countOutgoing(this.app.vault, this.couchStateFor(chosen));
-        return { outgoing, firstSync: false };
-      }
       remote = buildRepoUrl(res.gitEndpoint, chosen);
     }
     return this.buildController().preview({ url: remote, token });
@@ -797,8 +627,6 @@ export default class AgentageMemoryPlugin extends Plugin implements SettingsHost
     this.settings = { ...DEFAULT_SETTINGS, ...data };
     this.settings.origin = { ...DEFAULT_SETTINGS.origin, ...this.settings.origin };
     if (!Array.isArray(this.settings.mcp)) this.settings.mcp = [...DEFAULT_SETTINGS.mcp];
-    // Fresh object so mutating couch state never aliases the shared DEFAULT_SETTINGS.
-    this.settings.couchState = { ...(data?.couchState ?? {}) };
   }
 
   async saveSettings(): Promise<void> {
