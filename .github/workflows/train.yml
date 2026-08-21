@@ -1,22 +1,22 @@
 name: Release Train
 
-# Fully automated Friday MINOR release of the Obsidian community-store plugin.
+# v2-lite direct-to-master MINOR release of the Obsidian community-store plugin.
 # No human step on the happy path. Weekly cadence, always a minor bump (L0).
 #
 # Flow: wait for org dependabot triage -> skip if no releasable commits since the
 # last tag (docs/ci/plain-chore excluded, chore(deps) counts) -> minor bump via the
 # repo's own `npm version` (the `version` script runs scripts/version-bump.mjs,
 # updating package.json + manifest.json + versions.json) -> `npm run verify` ->
-# open `chore(release): X.Y.Z` PR -> auto-merge -> dispatch release.yml in
-# build-current mode, which tags the bare version X.Y.Z (Obsidian requires
-# tag == manifest.json version) and builds + publishes the GitHub Release with the
-# plugin assets (main.js, manifest.json, styles.css).
+# commit `chore(release): X.Y.Z` straight to master (no release/* branch, no PR) ->
+# dispatch release.yml in build-current mode, which tags the bare version X.Y.Z
+# (Obsidian requires tag == manifest.json version) and builds + publishes the
+# GitHub Release with the plugin assets (main.js, manifest.json, styles.css).
 #
-# GITHUB_TOKEN caveats handled here: its branch push does not fire pr-validation on
-# the release PR (the in-workflow `npm run verify` plus release.yml's verify are the
-# CI gates; master-protection requires a PR but 0 approvals and no status checks, so
-# --auto lands in a clean status and the direct-squash fallback merges), and its
-# merge never fires other workflows - so the publish chain is dispatched explicitly.
+# 2026-08-22 migration off the release-PR pattern: branch -> PR -> auto-merge ->
+# approve/poll broke 3 different ways in 3 weeks across the estate. This train now
+# pushes the release commit straight to master and fails closed instead - a push
+# failure is red (never forced), and the dispatched release.yml run is watched to
+# conclusion with the published GitHub release asserted before the job is green.
 on:
   schedule:
     # Single UTC cron (L0 slot). A late-firing cron means the train departs
@@ -55,7 +55,7 @@ jobs:
           echo "Dependabot PR(s) still open after wait - releasing without them." | tee -a "$GITHUB_STEP_SUMMARY"
 
   release:
-    name: 🚝 Cut minor release
+    name: 🚝 Cut minor release direct to master
     needs: dependabot-quiescence
     runs-on: ubuntu-latest
     timeout-minutes: 30
@@ -74,23 +74,8 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Skip if an open release PR exists
-        id: guard
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          EXISTING=$(gh pr list --state open --json headRefName \
-            --jq '[.[] | select(.headRefName | startswith("release/"))] | length')
-          if [ "$EXISTING" != "0" ]; then
-            echo "Open release PR already exists - a previous train is stuck. Skipping." | tee -a "$GITHUB_STEP_SUMMARY"
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "skip=false" >> "$GITHUB_OUTPUT"
-          fi
-
       - name: Detect releasable commits since the last tag
         id: detect
-        if: steps.guard.outputs.skip != 'true'
         run: |
           set -euo pipefail
           # Highest semver tag, NOT `git describe`: historical tags were made on
@@ -126,7 +111,7 @@ jobs:
 
       - name: Bump minor version (no tag)
         id: bump
-        if: steps.guard.outputs.skip != 'true' && steps.detect.outputs.release == 'true'
+        if: steps.detect.outputs.release == 'true'
         run: |
           set -euo pipefail
           # --no-git-tag-version: skip commit + tag; the `version` script still runs
@@ -141,40 +126,73 @@ jobs:
         if: steps.bump.outputs.version
         run: npm run verify
 
-      - name: Create + auto-merge release PR
-        id: pr
+      - name: Commit + push release directly to master
+        id: push
         if: steps.bump.outputs.version
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
           VERSION="${{ steps.bump.outputs.version }}"
-          BRANCH="release/${VERSION}"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git checkout -b "$BRANCH"
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+
           git add package.json package-lock.json manifest.json versions.json
           git commit -m "chore(release): ${VERSION}"
-          git push origin "$BRANCH"
-          PR_URL=$(gh pr create --base master --head "$BRANCH" \
-            --title "chore(release): ${VERSION}" \
-            --body "Weekly minor release train. Bumps package.json + manifest.json + versions.json to ${VERSION}. After merge, release.yml is dispatched in build-current mode to tag \`${VERSION}\` and publish the GitHub Release the Obsidian store installs from.")
-          echo "pr_url=$PR_URL" >> "$GITHUB_OUTPUT"
-          sleep 5
-          # --auto waits for required checks; master-protection has none, so GitHub
-          # rejects --auto with "clean status" and the direct squash lands it.
-          if ! OUT=$(gh pr merge "$PR_URL" --auto --squash 2>&1); then
-            echo "$OUT"
-            echo "$OUT" | grep -q "clean status" && gh pr merge "$PR_URL" --squash || exit 1
-          fi
+
+          # Rebase onto whatever landed on master since checkout, then push
+          # directly - no branch, no PR, no merge. A push failure is red, never
+          # forced.
+          git pull --rebase origin master
+          git push origin HEAD:master
+
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Dispatch release workflow (build-current)
-        if: steps.pr.outputs.pr_url
+        if: steps.push.outputs.version
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # A GITHUB_TOKEN merge never fires release.yml, so dispatch it explicitly.
-          # build_current=true makes release.yml tag + build + release the version
-          # already on master's manifest.json (no re-bump).
+          set -euo pipefail
+          # A GITHUB_TOKEN push never fires other workflows, so dispatch release.yml
+          # explicitly. build_current=true makes it tag + build + release the version
+          # already on master's manifest.json (no re-bump, no PR).
           gh workflow run release.yml --ref master --repo "${{ github.repository }}" -f build_current=true
-          echo "Released ${{ steps.bump.outputs.version }} - release.yml dispatched (build-current)." >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Wait for release.yml + verify published release
+        if: steps.push.outputs.version
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.push.outputs.version }}"
+          DISPATCH_EPOCH=$(date -u +%s)
+
+          # gh workflow run doesn't return a run id, so poll gh run list for the
+          # release.yml run that appeared after our dispatch.
+          RUN_ID=""
+          for i in $(seq 1 18); do
+            sleep 10
+            RUN_ID=$(gh run list --repo "$REPO" --workflow=release.yml --branch master \
+              --json databaseId,createdAt --jq \
+              "[.[] | select((.createdAt | fromdateiso8601) >= ($DISPATCH_EPOCH - 15))] | .[0].databaseId // empty")
+            [ -n "$RUN_ID" ] && break
+            echo "poll $i: dispatched release.yml run not visible yet..."
+          done
+          [ -n "$RUN_ID" ] || { echo "::error::Could not find the dispatched release.yml run."; exit 1; }
+
+          echo "Watching release.yml run $RUN_ID to conclusion..."
+          gh run watch "$RUN_ID" --repo "$REPO" --exit-status
+
+          echo "Verifying GitHub release ${VERSION} was published with the expected assets..."
+          RELEASE_JSON=$(gh release view "$VERSION" --repo "$REPO" --json tagName,assets)
+          TAG=$(echo "$RELEASE_JSON" | jq -r '.tagName')
+          [ "$TAG" = "$VERSION" ] || { echo "::error::Release tag '$TAG' does not match expected '$VERSION'"; exit 1; }
+          for ASSET in main.js manifest.json styles.css; do
+            echo "$RELEASE_JSON" | jq -e --arg a "$ASSET" '.assets[] | select(.name == $a)' >/dev/null \
+              || { echo "::error::Release ${VERSION} is missing asset $ASSET"; exit 1; }
+          done
+          echo "Release ${VERSION} published with expected assets (main.js, manifest.json, styles.css)." >> "$GITHUB_STEP_SUMMARY"
+          echo "Released ${VERSION} direct to master - release.yml dispatched (build-current)." >> "$GITHUB_STEP_SUMMARY"
