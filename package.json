@@ -57,7 +57,7 @@
   },
   "dependencies": {
     "diff3": "^0.0.4",
-    "isomorphic-git": "^1.41.9",
+    "isomorphic-git": "1.41.5",
     "js-yaml": "^5.4.0"
   }
 }
