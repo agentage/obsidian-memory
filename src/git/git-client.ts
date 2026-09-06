@@ -128,9 +128,11 @@ export function createGitClient({ fs, http }: GitClientDeps, mergeDriver: MergeD
         if (!r.ok) throw new Error('push not ok');
         return { conflicted: [] };
       } catch (e) {
-        if (e instanceof Errors.PushRejectedError) {
+        if (e instanceof Errors.PushRejectedError || e instanceof Errors.NotFoundError) {
           // Someone pushed between our pull and push. Re-pull (merge); if THAT conflicts,
           // propagate it instead of blindly re-pushing into a "not ok after rebase" error.
+          // NotFoundError: since iso-git 1.41.7 (#2412) an advanced remote head surfaces as
+          // NotFoundError from the speculative merge-base walk, before PushRejectedError.
           const pulled = await client.pull(c);
           if (pulled.conflicted.length > 0 || pulled.unmergeable) return pulled;
           const r2 = await doPush();
